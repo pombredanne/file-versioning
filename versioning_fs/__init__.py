@@ -10,7 +10,6 @@ from StringIO import StringIO
 from subprocess import Popen, PIPE
 import time
 
-from fs.base import synchronize
 from fs.filelike import FileWrapper
 from fs.errors import OperationFailedError, ResourceNotFoundError
 from fs.path import relpath
@@ -54,7 +53,9 @@ class VersionInfoMixIn(object):
     def list_versions(self, path):
         """Returns a list of the versions for a file."""
         snap_dir = self.snapshot_snap_path(path)
-        command = ['rdiff-backup', '--parsable-output', '-l', snap_dir]
+        command = ['rdiff-backup',
+                   '--parsable-output',
+                   '-l', snap_dir]
         process = Popen(command, stdout=PIPE, stderr=PIPE)
         stdout = process.communicate()[0]
 
@@ -87,8 +88,10 @@ class VersionInfoMixIn(object):
         """Returns a dictionary containing sizes for each version of a path.
         """
         snap_dir = self.snapshot_snap_path(path)
-        command = ['rdiff-backup', '--parsable-output',
-                   '--list-increment-sizes', snap_dir]
+        command = ['rdiff-backup',
+                   '--parsable-output',
+                   '--list-increment-sizes',
+                   snap_dir]
         process = Popen(command, stdout=PIPE, stderr=PIPE)
         stdout = process.communicate()[0]
 
@@ -158,9 +161,9 @@ class VersioningFS(VersionInfoMixIn, HideFS):
         self.__tmp.close()
         super(VersioningFS, self).close(*args, **kwargs)
 
-    @synchronize
     def open(self, path, mode='r', buffering=-1, encoding=None, errors=None,
-             newline=None, line_buffering=False, version=None, **kwargs):
+             newline=None, line_buffering=False, version=None,
+             take_snapshot=True, **kwargs):
         """
         Returns a file-object. The file-object is wrapped with VersionedFile,
             which will notify VersioningFS to make a snapshot whenever
@@ -172,6 +175,8 @@ class VersioningFS(VersionInfoMixIn, HideFS):
           version (int) (optional): Specifies which version of the file to
             get. If version is set to None, the most recent copy of the file
             will be returned.
+          snapshot (bool): Set to False to avoid taking a snapshot. Defaults
+            to True.
         """
         path = relpath(path)
         if version is None:
@@ -182,7 +187,7 @@ class VersioningFS(VersionInfoMixIn, HideFS):
                                         line_buffering=line_buffering,
                                         **kwargs)
             return VersionedFile(fs=self, file_object=file_object, mode=mode,
-                                 path=path)
+                                 path=path, take_snapshot=take_snapshot)
         else:
             if version < 1:
                 raise ResourceNotFoundError("Version %s not found" %
@@ -195,7 +200,8 @@ class VersioningFS(VersionInfoMixIn, HideFS):
                                             line_buffering=line_buffering,
                                             **kwargs)
                 return VersionedFile(fs=self, file_object=file_object,
-                                     mode=mode, temp_file=False, path=path)
+                                     mode=mode, temp_file=False, path=path,
+                                     take_snapshot=take_snapshot)
 
             snap_dir = self.snapshot_snap_path(path)
 
@@ -205,7 +211,7 @@ class VersioningFS(VersionInfoMixIn, HideFS):
                                             (version))
 
             requested_version = sorted_versions[version-1]
-            if "w" not in mode:
+            if mode == "r" or mode == "rb":
                 temp_name = '%020x' % random.randrange(16**30)
                 dest_path = os.path.join(self.tmp.getsyspath('/'), temp_name)
                 command = ['rdiff-backup',
@@ -291,14 +297,12 @@ class VersioningFS(VersionInfoMixIn, HideFS):
                 shutil.rmtree(dst_snapshot)
             shutil.move(src_snapshot, dst_snapshot)
 
-    @synchronize
     def snapshot(self, path):
         """Takes a snapshot of an individual file."""
 
         # try grabbing the temp filesystem system path
         temp_dir = None
-        if 'getsyspath' in dir(self.tmp):
-            temp_dir = self.tmp.getsyspath('/')
+        temp_dir = self.tmp.getsyspath('/')
 
         # Create a temp file system to be snapshotted
         temp_snapshot_fs = TempFS(temp_dir=temp_dir)
@@ -311,8 +315,13 @@ class VersioningFS(VersionInfoMixIn, HideFS):
         # snapshot destination directory
         dest_dir = self.snapshot_snap_path(path)
 
-        command = ['rdiff-backup', '--parsable-output', '--no-eas',
-                   '--no-file-statistics', '--no-acls', src_path, dest_dir]
+        command = ['rdiff-backup',
+                   '--parsable-output',
+                   '--no-eas',
+                   '--no-file-statistics',
+                   '--no-acls',
+                   '--tempdir', self.tmp.getsyspath('/'),
+                   src_path, dest_dir]
 
         # speed up the tests
         if self.__testing:
@@ -333,7 +342,6 @@ class VersioningFS(VersionInfoMixIn, HideFS):
         # close the temp snapshot filesystem
         temp_snapshot_fs.close()
 
-    @synchronize
     def remove_versions_before(self, path, version):
         """Removes snapshots before a specified version.
 
@@ -369,8 +377,12 @@ class VersioningFS(VersionInfoMixIn, HideFS):
             date_to_delete = version
 
         snap_dir = self.snapshot_snap_path(path)
-        command = ['rdiff-backup', '--parsable-output', '--force',
-                   '--remove-older-than', str(date_to_delete), snap_dir]
+        command = ['rdiff-backup',
+                   '--parsable-output',
+                   '--force',
+                   '--remove-older-than', str(date_to_delete),
+                   '--tempdir', self.tmp.getsyspath('/'),
+                   snap_dir]
         process = Popen(command, stdout=PIPE, stderr=PIPE)
         stderr = process.communicate()[1]
 
@@ -404,15 +416,17 @@ class VersionedFile(FileWrapper):
        snapshot if the file has been modified.
     """
     def __init__(self, file_object, mode, fs, path, temp_file=False,
-                 remove=None):
+                 remove=None, take_snapshot=True):
         super(VersionedFile, self).__init__(file_object, mode)
         self.__fs = fs
         self.__path = path
         self._is_temp_file = temp_file
         self.__is_modified = False
+        self.__take_snapshot = take_snapshot
 
         self.__file_object = file_object
         self.__remove = remove
+        self.__version_created = False
 
     def _write(self, *args, **kwargs):
         self.__is_modified = True
@@ -431,12 +445,14 @@ class VersionedFile(FileWrapper):
             remove = os.path.join(self.__fs.tmp, self.__remove)
             shutil.rmtree(remove)
 
-        if self.__is_modified:
+        if not self.__version_created and self.__take_snapshot and \
+                self.__is_modified:
             max_tries = 3  # limit the amount of tries to make a snapshot
 
             for _ in range(max_tries):
                 try:
                     self.__fs.snapshot(self.__path)
+                    self.__version_created = True
                 except SnapshotError:
                     # rdiff-backup must wait 1 second between the same file.
                     time.sleep(1)
